@@ -1,86 +1,80 @@
 package runconfig
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
 
-	"github.com/docker/docker/engine"
-	"github.com/docker/docker/nat"
-	"github.com/docker/docker/utils"
+	"github.com/docker/docker/api/types/container"
 )
 
-type NetworkMode string
+// DecodeHostConfig creates a HostConfig based on the specified Reader.
+// It assumes the content of the reader will be JSON, and decodes it.
+func DecodeHostConfig(src io.Reader) (*container.HostConfig, error) {
+	decoder := json.NewDecoder(src)
 
-func (n NetworkMode) IsHost() bool {
-	return n == "host"
+	var w ContainerConfigWrapper
+	if err := decoder.Decode(&w); err != nil {
+		return nil, err
+	}
+
+	hc := w.getHostConfig()
+	return hc, nil
 }
 
-func (n NetworkMode) IsContainer() bool {
-	parts := strings.SplitN(string(n), ":", 2)
-	return len(parts) > 1 && parts[0] == "container"
+// SetDefaultNetModeIfBlank changes the NetworkMode in a HostConfig structure
+// to default if it is not populated. This ensures backwards compatibility after
+// the validation of the network mode was moved from the docker CLI to the
+// docker daemon.
+func SetDefaultNetModeIfBlank(hc *container.HostConfig) {
+	if hc != nil {
+		if hc.NetworkMode == container.NetworkMode("") {
+			hc.NetworkMode = container.NetworkMode("default")
+		}
+	}
 }
 
-type DeviceMapping struct {
-	PathOnHost        string
-	PathInContainer   string
-	CgroupPermissions string
-}
-
-type RestartPolicy struct {
-	Name              string
-	MaximumRetryCount int
-}
-
-type HostConfig struct {
-	Binds           []string
-	ContainerIDFile string
-	LxcConf         []utils.KeyValuePair
-	Privileged      bool
-	PortBindings    nat.PortMap
-	Links           []string
-	PublishAllPorts bool
-	Dns             []string
-	DnsSearch       []string
-	VolumesFrom     []string
-	Devices         []DeviceMapping
-	NetworkMode     NetworkMode
-	CapAdd          []string
-	CapDrop         []string
-	RestartPolicy   RestartPolicy
-}
-
-func ContainerHostConfigFromJob(job *engine.Job) *HostConfig {
-	hostConfig := &HostConfig{
-		ContainerIDFile: job.Getenv("ContainerIDFile"),
-		Privileged:      job.GetenvBool("Privileged"),
-		PublishAllPorts: job.GetenvBool("PublishAllPorts"),
-		NetworkMode:     NetworkMode(job.Getenv("NetworkMode")),
+// validateNetContainerMode ensures that the various combinations of requested
+// network settings wrt container mode are valid.
+func validateNetContainerMode(c *container.Config, hc *container.HostConfig) error {
+	// We may not be passed a host config, such as in the case of docker commit
+	if hc == nil {
+		return nil
+	}
+	parts := strings.Split(string(hc.NetworkMode), ":")
+	if parts[0] == "container" {
+		if len(parts) < 2 || parts[1] == "" {
+			return fmt.Errorf("--net: invalid net mode: invalid container format container:<name|id>")
+		}
 	}
 
-	job.GetenvJson("LxcConf", &hostConfig.LxcConf)
-	job.GetenvJson("PortBindings", &hostConfig.PortBindings)
-	job.GetenvJson("Devices", &hostConfig.Devices)
-	job.GetenvJson("RestartPolicy", &hostConfig.RestartPolicy)
-	if Binds := job.GetenvList("Binds"); Binds != nil {
-		hostConfig.Binds = Binds
-	}
-	if Links := job.GetenvList("Links"); Links != nil {
-		hostConfig.Links = Links
-	}
-	if Dns := job.GetenvList("Dns"); Dns != nil {
-		hostConfig.Dns = Dns
-	}
-	if DnsSearch := job.GetenvList("DnsSearch"); DnsSearch != nil {
-		hostConfig.DnsSearch = DnsSearch
-	}
-	if VolumesFrom := job.GetenvList("VolumesFrom"); VolumesFrom != nil {
-		hostConfig.VolumesFrom = VolumesFrom
-	}
-	if CapAdd := job.GetenvList("CapAdd"); CapAdd != nil {
-		hostConfig.CapAdd = CapAdd
-	}
-	if CapDrop := job.GetenvList("CapDrop"); CapDrop != nil {
-		hostConfig.CapDrop = CapDrop
+	if hc.NetworkMode.IsContainer() && c.Hostname != "" {
+		return ErrConflictNetworkHostname
 	}
 
-	return hostConfig
+	if hc.NetworkMode.IsContainer() && len(hc.Links) > 0 {
+		return ErrConflictContainerNetworkAndLinks
+	}
+
+	if hc.NetworkMode.IsContainer() && len(hc.DNS) > 0 {
+		return ErrConflictNetworkAndDNS
+	}
+
+	if hc.NetworkMode.IsContainer() && len(hc.ExtraHosts) > 0 {
+		return ErrConflictNetworkHosts
+	}
+
+	if (hc.NetworkMode.IsContainer() || hc.NetworkMode.IsHost()) && c.MacAddress != "" {
+		return ErrConflictContainerNetworkAndMac
+	}
+
+	if hc.NetworkMode.IsContainer() && (len(hc.PortBindings) > 0 || hc.PublishAllPorts == true) {
+		return ErrConflictNetworkPublishPorts
+	}
+
+	if hc.NetworkMode.IsContainer() && len(c.ExposedPorts) > 0 {
+		return ErrConflictNetworkExposePorts
+	}
+	return nil
 }

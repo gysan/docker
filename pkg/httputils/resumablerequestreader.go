@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/docker/docker/pkg/log"
+	"github.com/Sirupsen/logrus"
 )
 
 type resumableRequestReader struct {
@@ -17,17 +17,20 @@ type resumableRequestReader struct {
 	currentResponse *http.Response
 	failures        uint32
 	maxFailures     uint32
+	waitDuration    time.Duration
 }
 
 // ResumableRequestReader makes it possible to resume reading a request's body transparently
 // maxfail is the number of times we retry to make requests again (not resumes)
 // totalsize is the total length of the body; auto detect if not provided
 func ResumableRequestReader(c *http.Client, r *http.Request, maxfail uint32, totalsize int64) io.ReadCloser {
-	return &resumableRequestReader{client: c, request: r, maxFailures: maxfail, totalSize: totalsize}
+	return &resumableRequestReader{client: c, request: r, maxFailures: maxfail, totalSize: totalsize, waitDuration: 5 * time.Second}
 }
 
+// ResumableRequestReaderWithInitialResponse makes it possible to resume
+// reading the body of an already initiated request.
 func ResumableRequestReaderWithInitialResponse(c *http.Client, r *http.Request, maxfail uint32, totalsize int64, initialResponse *http.Response) io.ReadCloser {
-	return &resumableRequestReader{client: c, request: r, maxFailures: maxfail, totalSize: totalsize, currentResponse: initialResponse}
+	return &resumableRequestReader{client: c, request: r, maxFailures: maxfail, totalSize: totalsize, currentResponse: initialResponse, waitDuration: 5 * time.Second}
 }
 
 func (r *resumableRequestReader) Read(p []byte) (n int, err error) {
@@ -38,7 +41,7 @@ func (r *resumableRequestReader) Read(p []byte) (n int, err error) {
 	if r.lastRange != 0 && r.currentResponse == nil {
 		readRange := fmt.Sprintf("bytes=%d-%d", r.lastRange, r.totalSize)
 		r.request.Header.Set("Range", readRange)
-		time.Sleep(5 * time.Second)
+		time.Sleep(r.waitDuration)
 	}
 	if r.currentResponse == nil {
 		r.currentResponse, err = r.client.Do(r.request)
@@ -46,8 +49,8 @@ func (r *resumableRequestReader) Read(p []byte) (n int, err error) {
 	}
 	if err != nil && r.failures+1 != r.maxFailures {
 		r.cleanUpResponse()
-		r.failures += 1
-		time.Sleep(5 * time.Duration(r.failures) * time.Second)
+		r.failures++
+		time.Sleep(time.Duration(r.failures) * r.waitDuration)
 		return 0, nil
 	} else if err != nil {
 		r.cleanUpResponse()
@@ -72,7 +75,7 @@ func (r *resumableRequestReader) Read(p []byte) (n int, err error) {
 		r.cleanUpResponse()
 	}
 	if err != nil && err != io.EOF {
-		log.Infof("encountered error during pull and clearing it before resume: %s", err)
+		logrus.Infof("encountered error during pull and clearing it before resume: %s", err)
 		err = nil
 	}
 	return n, err
